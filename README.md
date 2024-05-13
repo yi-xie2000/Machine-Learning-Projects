@@ -1,0 +1,547 @@
+---
+title: "Enhancing Telemarketing Success: Predictive Analytics for Bank Campaigns"
+author: "Yi Xie"
+date: "2023-04-11"
+output: html_document
+---
+```{r warning=FALSE}
+library(ggplot2)
+library(lattice)
+library(RBootcamp)
+library(ROCR)
+library(PASWR)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(ROSE)
+library(e1071)
+library(randomForest)
+```
+
+# 1. Get the data bank.csv and prepare it
+```{r}
+#get data
+df <- read.csv(file = "bank.csv", head = TRUE, sep=";")
+
+#check n/a
+anyNA(df) #FALSE: the data set doesn't include n/a
+
+#check class balance
+barplot(prop.table(table(df$y)),
+        col = rainbow(2),
+        ylim = c(0, 0.7),
+        main = "Class Distribution")
+
+#correcting chr variable
+df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)],
+                                       as.factor)
+
+#check “near-zero-variance” predictors
+a<- nearZeroVar(df, saveMetrics= TRUE)
+ind1 <- which(a$nzv)
+ind2 <- colnames(df)
+name_drop <- ind2[ind1]
+
+#drop “near-zero-variance” predictors
+df <- df[ , ! names(df) %in% c("default","pdays")]
+```
+
+# 2. Random Forest and LPM
+# 2-1 Report the test AUC and its 95% CI for both model
+```{r warning=FALSE}
+m <- 100 #how many loops we run
+B <- 100 #how many trees we have
+
+AUC_lm <- c()
+AUC_RF <- c()
+AUC_oob <- c()
+
+#split the data to model and test
+for (i in 1:m) {
+  
+  set.seed(i*10)
+  ind <- sample(nrow(df), nrow(df)*0.9, replace = T) #select the 90% data
+  model_d <- df[ind, ] #assign 90% data to the model data
+  test <- df[-ind, ] #10% data is assigned to the test
+  
+  #split the model data to train and invalid
+  for (b in 1:B){
+    
+    #bootstrapping
+    ind2 <- sample(nrow(model_d), nrow(model_d), replace = TRUE)
+    bsampl <- model_d[ind2, ]
+    
+    #fit_LPM
+    fit_lm <- lm(y ~ ., data = bsampl)
+    phat_lm <- predict(fit_lm, test)
+    phat_lm[phat_lm < 0] <- 0
+    phat_lm[phat_lm > 1] <- 1
+    
+    #fit_RF (single pruned tree)
+    fit_RF <- randomForest(y ~ .,
+                           data = model_d,
+                           ntree = B,
+                           localImp = TRUE)
+  
+    phat_RF <- predict(fit_RF, test, type = "prob")
+
+    oob <- fit_RF$vote
+    oob <- oob[,2]
+    oobna <- which(is.na(oob))
+    
+      for (j in 1:length(oobna)) {
+        
+      oob[oobna[j]] <- 0
+        
+      }
+  }
+  
+  #AUC_lm
+  phat_df_lm <- data.frame(phat_lm, "y" = test$y)
+  pred_lm <- prediction(phat_df_lm[, 1], phat_df_lm[, 2])
+  auc_lm <- performance(pred_lm, measure = "auc")
+  AUC_lm[i] <- auc_lm@y.values[[1]]
+  
+  #AUC_RF
+  pred_RF <- prediction(phat_RF[,2], test$y)
+  auc_RF <- performance(pred_RF, measure = "auc")
+  AUC_RF[i] <- auc_RF@y.values[[1]]
+  
+  #AUC_oob
+  pred_oob <- prediction(oob, model_d$y)
+  auc_oob <- performance(pred_oob, measure = "auc")
+  AUC_oob[i] <- auc_oob@y.values[[1]]
+  
+}
+
+#lm
+mean_lm <- mean(AUC_lm)
+sd_lm <- sd(AUC_lm)
+#95% CI
+RF_low <- mean(AUC_RF) - 1.95*sd(AUC_RF)
+RF_up <- mean(AUC_RF) + 1.95*sd(AUC_RF)
+
+
+#RF
+mean_RF <- mean(AUC_RF)
+sd_RF <- sd(AUC_RF)
+#95% CI
+lm_low <- mean(AUC_lm) - 1.95*sd(AUC_lm)
+lm_up <- mean(AUC_lm) + 1.95*sd(AUC_lm)
+
+
+#summarize
+sum1 <- rbind(mean_lm, mean_RF)
+sum2 <- rbind(sd_lm, mean_RF)
+sum3 <- rbind(lm_low, RF_low)
+sum4 <- rbind(lm_up, RF_up)
+sum <- cbind(sum1, sum2, sum3, sum4)
+row.names(sum) <- c("lm", "RF")
+colnames(sum) <- c("mean_AUC", "sd_AUC", "CI_low", "CI_up")
+sum
+
+#plot
+par(mfrow=c(2,2))
+plot(AUC_lm, col = "darkgreen")
+plot(AUC_RF, col = "pink")
+```
+
+# 2-2 Report the variable importance by MDI for the top 6 predictors from 100 runs
+```{r warning=FALSE}
+library(randomForestExplainer)
+importance_frame <- measure_importance(fit_RF)
+importance_frame
+
+plot_multi_way_importance(importance_frame, x_measure = "mean_min_depth",
+                          y_measure = "gini_decrease",
+                          size_measure = "p_value", no_of_labels = 6)
+```
+
+# 2-3 What’s the OOB confusion matrix after 100 runs of random fores
+```{r}
+oobcm <- fit_RF$confusion
+```
+
+# 2-4 Compare your test AUCs and OOB AUC
+```{r}
+#compare oob and rf
+mean_oob <- mean(AUC_oob)
+comp <- rbind(mean_oob, mean_RF)
+rownames(comp) <- c("oob", "RF")
+colnames(comp) <- c("AUC")
+comp
+```
+
+
+# 3. Apply GBM with gbm (Bernoulli) and gbm (Adaboost)
+# 3-1
+```{r}
+library(gbm)
+
+df$y <- ifelse(df$y == "no", 0, 1)
+
+h <- seq(0.01, 0.1, 0.01) #interaction.depth
+B <- c(300,500,700) #trees
+D <- 1:2 #shrinkage
+grid <- as.matrix(expand.grid(D, B, h))
+
+AUC_b <- c()
+AUC_a <- c()
+
+for(i in 1:nrow(grid)){
+  
+  
+  #for (j in 1:3) {
+  #  try({
+      
+    ind <- sample(nrow(df), nrow(df), replace = TRUE)
+    train <- df[ind, ]
+    test <- df[-ind, ]
+    
+    boob <- gbm(y~., 
+                distribution ="bernoulli", 
+                n.trees=1000,
+                interaction.depth = grid[i,1], 
+                shrinkage = grid[i,3], 
+                data = train)
+    
+    booa <- gbm(y~., 
+                distribution ="adaboost", 
+                n.trees=1000,
+                interaction.depth = grid[i,1], 
+                shrinkage = grid[i,3], 
+                data = train)
+    
+    prboob <- predict(boob, test, n.trees = grid[i,2], type = "response")
+
+    prbooa <- predict(booa, test, n.trees = grid[i,2], type = "response")
+
+    
+  #  }, silent = TRUE)
+    
+  #}
+  
+  pred_rocr_b <- prediction(prboob, test$y)
+  auc_ROCR_b <- performance(pred_rocr_b, measure = "auc")
+  AUC_b[i] <- auc_ROCR_b@y.values[[1]]
+  
+  pred_rocr_a <- prediction(prbooa, test$y)
+  auc_ROCR_a <- performance(pred_rocr_a, measure = "auc")
+  AUC_a[i] <- auc_ROCR_a@y.values[[1]]
+}
+
+plot
+par(mfrow=c(2,2))
+plot(AUC_b, col = "darkgreen")
+plot(AUC_a, col = "pink")
+
+best_b <- grid[as.numeric(which.max(AUC_b)), ]
+best_a <- grid[as.numeric(which.max(AUC_a)), ]
+
+best_h_b <- as.numeric(best_b[1])
+best_B_b <- as.numeric(best_b[2])
+best_D_b <- as.numeric(best_b[3])
+
+best_h_a <- as.numeric(best_a[1])
+best_B_a <- as.numeric(best_a[2])
+best_D_a <- as.numeric(best_a[3])
+```
+
+# 3-2
+```{r}
+best_h_b <- as.numeric(best_b[1])
+best_B_b <- as.numeric(best_b[2])
+best_D_b <- as.numeric(best_b[3])
+
+best_h_a <- as.numeric(best_a[1])
+best_B_a <- as.numeric(best_a[2])
+best_D_a <- as.numeric(best_a[3])
+
+n <- 50 #how many times want to run
+
+AUC1 <- c()
+AUC2 <- c()
+
+for (i in 1:n) {
+  set.seed(i)
+  ind <- sample(nrow(df), nrow(df), replace = TRUE)
+  train <- df[ind, ]
+  test <- df[-ind, ]
+  
+  model1 <- gbm(y~., 
+                distribution ="bernoulli", 
+                n.trees= best_B_b,
+                shrinkage = best_D_b, 
+                data = train)
+  
+  model2 <- gbm(y~., 
+                distribution ="adaboost", 
+                n.trees= best_B_a,
+                shrinkage = best_D_a, 
+                data = train)
+    
+  phat1 <- predict(model1, test, n.trees = best_B_b, type = "response")
+  phat2 <- predict(model2, test, n.trees = best_B_a, type = "response")
+  
+  
+  #AUC1
+  pred_rocr1 <- prediction(phat1, test$y)
+  auc_ROCR1 <- performance(pred_rocr1, measure = "auc")
+  AUC1[i] <- auc_ROCR1@y.values[[1]]
+  
+  #AUC2
+  pred_rocr2 <- prediction(phat2, test$y)
+  auc_ROCR2 <- performance(pred_rocr2, measure = "auc")
+  AUC2[i] <- auc_ROCR2@y.values[[1]]
+}
+
+model <- c("bernoulli", "adaboost")
+AUCs <- c(mean(AUC1), mean(AUC2))
+sd <- c(sqrt(var(AUC1)), sqrt(var(AUC2)))
+data.frame(model, AUCs, sd) 
+```
+
+# 3-3
+```{r}
+gbm.perf(model1)
+gbm.perf(model2)
+```
+
+
+# Bonus questions
+# 5-1
+```{r}
+rm(list = ls())
+#get data
+df <- read.csv(file = "bank.csv", head = TRUE, sep=";")
+
+#correcting chr variable
+df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)],
+                                       as.factor)
+
+#check “near-zero-variance” predictors
+a<- nearZeroVar(df, saveMetrics= TRUE)
+ind1 <- which(a$nzv)
+ind2 <- colnames(df)
+name_drop <- ind2[ind1]
+
+#drop “near-zero-variance” predictors
+df <- df[ , ! names(df) %in% c("default","pdays")]
+
+library(AER)
+library(neuralnet)
+
+dff <- df
+
+# Scaling and Dummy coding
+dff[,sapply(dff, is.numeric)] <- scale((dff[, sapply(dff, is.numeric)]))
+
+ddf <- model.matrix(~.-1, data= dff, contrasts.arg =
+                       lapply(dff[, sapply(dff, is.factor)],
+                              contrasts, contrasts = FALSE))
+
+ddf <- data.frame(y = df$y, ddf)
+
+# Formula
+w.ind <- which(colnames(ddf) == "y")
+frm <- as.formula(paste("y~", paste(colnames(ddf[-w.ind]),
+                                        collapse = '+')))
+
+n <- 50
+AUC2 <- c()
+
+for (i in 1:n) {
+  set.seed(i)
+  ind <- unique(sample(nrow(ddf), nrow(ddf), replace = TRUE))
+  train <- ddf[ind, ]
+  test <- ddf[-ind, ]
+  
+  # Models
+  fit_nn <- neuralnet(frm,
+    data = train,
+    hidden = c(3, 2),
+    threshold = 0.05,
+    linear.output = FALSE,
+    err.fct = "ce")
+  
+  #Predictions
+  phatnn <- predict(fit_nn, test, type = "repsonse")[,2]
+
+  #AUC for predicting Y = 1
+  pred_rocr2 <- ROCR::prediction(phatnn, test$y)
+  auc_ROCR2 <- ROCR::performance(pred_rocr2, measure = "auc")
+  AUC2[i] <- auc_ROCR2@y.values[[1]]
+  
+
+}
+mean(AUC2)
+```
+
+
+# 5-2
+```{r warning=FALSE}
+rm(list = ls())
+#get data
+df <- read.csv(file = "bank.csv", head = TRUE, sep=";")
+
+#correcting chr variable
+df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)],
+                                       as.factor)
+
+#check “near-zero-variance” predictors
+a<- nearZeroVar(df, saveMetrics= TRUE)
+ind1 <- which(a$nzv)
+ind2 <- colnames(df)
+name_drop <- ind2[ind1]
+
+#drop “near-zero-variance” predictors
+df <- df[ , ! names(df) %in% c("default","pdays")]
+
+B <- 50 #how many trees we have
+
+TPR_lm <- c()
+FPR_lm <- c()
+
+TPR_RF <- c()
+FPR_RF <- c()
+
+th <- seq(0.3, 0.6, 0.01)
+
+#spit the data to model and test
+for (i in 1:length(th)) {
+  
+  set.seed(i*10)
+  ind <- sample(nrow(df), nrow(df)*0.9, replace = T) #select the 80% data
+  model_d <- df[ind, ] #assign 80% data to the model data
+  test <- df[-ind, ] #20% data is assigned to the test
+  
+  #split the model data to train and invalid
+  for (b in 1:B){
+    
+    #bootstapping
+    ind2 <- sample(nrow(model_d), nrow(model_d), replace = TRUE)
+    bsampl <- model_d[ind2, ]
+    
+    #fit_LPM
+    fit_lm <- lm(y ~ ., data = bsampl)
+    phat_lm <- predict(fit_lm, test)
+
+    phat_lm <- ifelse(phat_lm - 1 > th[i], 1, 0)
+    
+    #fit_RF (single pruned tree)
+    fit_RF <- randomForest(y ~ .,
+                   data = model_d,
+                   ntree = B,
+                   localImp = TRUE)
+  
+    phat_RF <- predict(fit_RF, test, type = "prob")
+
+  }
+  
+  phat_lm <- ifelse(phat_lm > th[i], 1, 0)
+  conf_table_lm <- table(phat_lm, test$y)
+  ct_lm<- as.matrix(conf_table_lm) 
+  
+  if(sum(dim(ct_lm))>3){ #here we ignore the thresholds 0 and 1
+    
+    TPR_lm[i] <- ct_lm[2,2]/(ct_lm[2,2]+ct_lm[1,2])
+    FPR_lm[i] <- ct_lm[2,1]/(ct_lm[1,1]+ct_lm[2,1])
+  }
+  
+#plot(FPR_lm, TPR_lm, col= "blue", type = "l", main = "ROC", lwd = 3)
+#abline(a = 0, b = 1, col="red")
+  
+  phat_RF <- phat_RF[, 2] > th[i]
+  conf_table_RF <- table(phat_RF, test$y)
+  ct_RF<- as.matrix(conf_table_RF) 
+  
+  if(sum(dim(ct_RF))>3){ #here we ignore the thresholds 0 and 1
+    
+    TPR_RF[i] <- ct_RF[2,2]/(ct_RF[2,2]+ct_RF[1,2])
+    FPR_RF[i] <- ct_RF[2,1]/(ct_RF[1,1]+ct_RF[2,1])
+  }
+  
+#plot(FPR_RF, TPR_RF, col= "yellow", type = "l", main = "ROC", lwd = 3)
+#abline(a = 0, b = 1, col="red")
+  
+}
+
+# Youden's J Statistics
+J_lm <- TPR_lm - FPR_lm
+# The best discriminating threshold
+th[which.max(J_lm)]
+
+# Youden's J Statistics
+J_RF <- TPR_RF - FPR_RF
+# The best discriminating threshold
+th[which.max(J_RF)]
+```
+
+# 5-3
+```{r warning=FALSE}
+library(ROCR)
+library(randomForest)
+
+rm(list = ls())
+#get data
+df <- read.csv(file = "bank.csv", head = TRUE, sep=";")
+
+#correcting chr variable
+df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)],
+                                       as.factor)
+
+#check “near-zero-variance” predictors
+a<- nearZeroVar(df, saveMetrics= TRUE)
+ind1 <- which(a$nzv)
+ind2 <- colnames(df)
+name_drop <- ind2[ind1]
+
+#drop “near-zero-variance” predictors
+df <- df[ , ! names(df) %in% c("default","pdays")]
+
+
+AUCb <- c()
+AUCimb <- c()
+n = 50 # Could be 50, since the data is large for RF
+B = 50
+
+for (i in 1:n) {
+  set.seed(i)
+  ind <- sample(nrow(df), nrow(df)*0.8, replace = TRUE)
+  
+  train <- df[ind, ]
+  test <- df[-ind, ]
+  
+  nmin = min(table(train$y))
+
+  # Balancing
+  modelb <- randomForest(y ~ ., 
+                           localImp = TRUE, 
+                           ntree = 1200, 
+                           data = train, 
+                           strata = train$y, 
+                           sampsize = rep(nmin, 2))
+  phatb <- predict(modelb, test, type = "prob")
+
+  # Without Balancing
+  modelimb <- randomForest(y~., ntree = B, data = train)
+  phatimb <- predict(modelimb, test, type = "prob")
+
+  #AUCb
+  pred_rocr1 <- ROCR::prediction(phatb[,2], test$y)
+  auc_ROCR1 <- ROCR::performance(pred_rocr1, measure = "auc")
+  AUCb[i] <- auc_ROCR1@y.values[[1]]
+
+  #AUCimb
+  pred_rocr1 <- ROCR::prediction(phatimb[,2], test$y)
+  auc_ROCR1 <- ROCR::performance(pred_rocr1, measure = "auc")
+  AUCimb[i] <- auc_ROCR1@y.values[[1]]
+}
+
+model <- c("Balanced", "Imbalanced")
+AUCs <- c(mean(AUCb), mean(AUCimb))
+sd <- c(sqrt(var(AUCb)), sqrt(var(AUCimb)))
+data.frame(model, AUCs, sd)
+```
+
+
